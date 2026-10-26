@@ -14,6 +14,7 @@ class CorsOriginsTest {
                 List.of(
                         "http://localhost:*",
                         "http://127.0.0.1:*",
+                        "https://*.vercel.app",
                         "https://complaints.example.com"),
                 CorsOrigins.allowedOriginPatterns(" https://complaints.example.com "));
     }
@@ -21,7 +22,7 @@ class CorsOriginsTest {
     @Test
     void keepsLocalOriginsWhenProductionFrontendIsUnset() {
         assertEquals(
-                List.of("http://localhost:*", "http://127.0.0.1:*"),
+                List.of("http://localhost:*", "http://127.0.0.1:*", "https://*.vercel.app"),
                 CorsOrigins.allowedOriginPatterns(""));
     }
 }

@@ -13,10 +13,11 @@ final class CorsOrigins {
     static List<String> allowedOriginPatterns(String frontendUrl) {
         List<String> origins = new ArrayList<>(List.of(
                 "http://localhost:*",
-                "http://127.0.0.1:*"));
+                "http://127.0.0.1:*",
+                "https://*.vercel.app"));
 
         if (frontendUrl != null && !frontendUrl.isBlank()) {
-            origins.add(frontendUrl.trim());
+            origins.add(frontendUrl.trim().replaceAll("/+$", ""));
         }
 
         return List.copyOf(origins);
