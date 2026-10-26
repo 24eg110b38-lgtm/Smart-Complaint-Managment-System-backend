@@ -1,9 +1,12 @@
 
 package com.smartcomplaint;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.lang.NonNull;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
@@ -13,11 +16,9 @@ import java.util.*;
 
 @RestController
 @RequestMapping("/api")
-@CrossOrigin(origins = {
-        "http://localhost:5173",
-        "http://localhost:5174"
-})
 public class ApiController {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(ApiController.class);
 
     private final DataSource dataSource;
     private final JwtService jwtService;
@@ -27,6 +28,26 @@ public class ApiController {
     public ApiController(DataSource dataSource, JwtService jwtService) {
         this.dataSource = dataSource;
         this.jwtService = jwtService;
+    }
+
+    @GetMapping("/health")
+    public ResponseEntity<Map<String, String>> health() {
+        try (Connection connection = dataSource.getConnection();
+             PreparedStatement statement = connection.prepareStatement("SELECT 1");
+             ResultSet result = statement.executeQuery()) {
+            if (result.next() && result.getInt(1) == 1) {
+                return ResponseEntity.ok(Map.of(
+                        "status", "UP",
+                        "database", "UP"));
+            }
+        } catch (SQLException e) {
+            logDatabaseFailure("health-check", e);
+        }
+
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(Map.of(
+                        "status", "DOWN",
+                        "database", "DOWN"));
     }
 
     // REGISTER
@@ -80,7 +101,7 @@ public class ApiController {
                         "This email is already registered.");
             }
 
-            e.printStackTrace();
+            logDatabaseFailure("register", e);
             return response(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Registration failed.");
         }
@@ -168,7 +189,7 @@ public class ApiController {
             }
 
         } catch (SQLException e) {
-            e.printStackTrace();
+            logDatabaseFailure("login", e);
             return response(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Login failed.");
         }
@@ -177,18 +198,25 @@ public class ApiController {
     // SUBMIT COMPLAINT
     @PostMapping("/complaints")
     public ResponseEntity<Map<String, Object>> submitComplaint(
+            Authentication authentication,
             @RequestBody Map<String, Object> body) {
 
-        int userId = intValue(body.get("userId"));
-        if (userId == 0) {
-            userId = intValue(body.get("user_id"));
+        int authenticatedUserId = authenticatedUserId(authentication);
+        int requestedUserId = intValue(body.get("userId"));
+        if (requestedUserId == 0) {
+            requestedUserId = intValue(body.get("user_id"));
         }
 
         String title = stringValue(body.get("title"));
         String description = stringValue(body.get("description"));
         String category = stringValue(body.get("category"));
 
-        if (userId <= 0 || title.isBlank()
+        if (authenticatedUserId <= 0 || requestedUserId != authenticatedUserId) {
+            return response(HttpStatus.FORBIDDEN,
+                    "You can only submit complaints for your own account.");
+        }
+
+        if (title.isBlank()
                 || description.isBlank() || category.isBlank()) {
             return response(HttpStatus.BAD_REQUEST,
                     "Please provide all complaint details.");
@@ -205,7 +233,7 @@ public class ApiController {
                      connection.prepareStatement(
                              sql, Statement.RETURN_GENERATED_KEYS)) {
 
-            statement.setInt(1, userId);
+            statement.setInt(1, authenticatedUserId);
             statement.setString(2, title);
             statement.setString(3, description);
             statement.setString(4, category);
@@ -224,7 +252,7 @@ public class ApiController {
             }
 
         } catch (SQLException e) {
-            e.printStackTrace();
+            logDatabaseFailure("submit-complaint", e);
             return response(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Could not submit complaint.");
         }
@@ -233,11 +261,26 @@ public class ApiController {
     // TRACK COMPLAINTS
     @GetMapping("/complaints")
     public ResponseEntity<?> getComplaints(
+            Authentication authentication,
             @RequestParam(required = false) Integer userId,
             @RequestParam(required = false) Integer user_id) {
 
         if (userId == null) {
             userId = user_id;
+        }
+
+        int authenticatedUserId = authenticatedUserId(authentication);
+        boolean administrator = isAuthenticatedAdmin(authentication)
+                && isAdmin(authenticatedUserId);
+
+        if (authenticatedUserId <= 0
+                || (userId != null && userId != authenticatedUserId && !administrator)) {
+            return response(HttpStatus.FORBIDDEN,
+                    "You can only view complaints available to your account.");
+        }
+
+        if (userId == null && !administrator) {
+            userId = authenticatedUserId;
         }
 
         String sql = """
@@ -272,7 +315,7 @@ public class ApiController {
             }
 
         } catch (SQLException e) {
-            e.printStackTrace();
+            logDatabaseFailure("list-complaints", e);
             return response(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Could not load complaints.");
         }
@@ -281,9 +324,14 @@ public class ApiController {
     // ADMIN: VIEW COMPLAINTS
     @GetMapping("/admin/complaints")
     public ResponseEntity<?> getAdminComplaints(
-            @RequestParam int adminId) {
+            Authentication authentication,
+            @RequestParam(required = false) Integer adminId) {
 
-        if (!isAdmin(adminId)) {
+        int authenticatedUserId = authenticatedUserId(authentication);
+        if (authenticatedUserId <= 0
+                || (adminId != null && adminId != authenticatedUserId)
+                || !isAuthenticatedAdmin(authentication)
+                || !isAdmin(authenticatedUserId)) {
             return response(HttpStatus.FORBIDDEN,
                     "Administrator access required.");
         }
@@ -310,7 +358,7 @@ public class ApiController {
             return ResponseEntity.ok(complaints);
 
         } catch (SQLException e) {
-            e.printStackTrace();
+            logDatabaseFailure("list-admin-complaints", e);
             return response(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Could not load administrator complaints.");
         }
@@ -320,14 +368,19 @@ public class ApiController {
     @PutMapping("/admin/complaints/{id}")
     public ResponseEntity<Map<String, Object>> updateComplaint(
             @PathVariable int id,
+            Authentication authentication,
             @RequestBody Map<String, Object> body) {
 
-        int adminId = intValue(body.get("adminId"));
+        int authenticatedUserId = authenticatedUserId(authentication);
+        int requestedAdminId = intValue(body.get("adminId"));
         String status = stringValue(body.get("status"))
                 .toUpperCase();
         String remark = stringValue(body.get("admin_remark"));
 
-        if (!isAdmin(adminId)) {
+        if (authenticatedUserId <= 0
+                || requestedAdminId != authenticatedUserId
+                || !isAuthenticatedAdmin(authentication)
+                || !isAdmin(authenticatedUserId)) {
             return response(HttpStatus.FORBIDDEN,
                     "Administrator access required.");
         }
@@ -362,7 +415,7 @@ public class ApiController {
                     "Complaint updated successfully!");
 
         } catch (SQLException e) {
-            e.printStackTrace();
+            logDatabaseFailure("update-complaint", e);
             return response(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Could not update complaint.");
         }
@@ -382,11 +435,30 @@ public class ApiController {
                         && "ADMIN".equalsIgnoreCase(
                                 rs.getString("role"));
             }
-
         } catch (SQLException e) {
-            e.printStackTrace();
+            logDatabaseFailure("check-admin-role", e);
             return false;
         }
+    }
+
+    private int authenticatedUserId(Authentication authentication) {
+        if (authentication == null || !authentication.isAuthenticated()) {
+            return 0;
+        }
+
+        return intValue(authentication.getName());
+    }
+
+    private boolean isAuthenticatedAdmin(Authentication authentication) {
+        return authentication != null
+                && authentication.getAuthorities().stream()
+                        .anyMatch(authority ->
+                                "ROLE_ADMIN".equals(authority.getAuthority()));
+    }
+
+    private void logDatabaseFailure(String operation, SQLException exception) {
+        LOGGER.error("Database operation failed: operation={}, SQLState={}, vendorCode={}",
+                operation, exception.getSQLState(), exception.getErrorCode());
     }
 
     private Map<String, Object> complaintFromRow(ResultSet rs)
